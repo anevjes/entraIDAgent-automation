@@ -1,4 +1,4 @@
-# Entra Agent Identity Tool (TL;DR)
+# Entra Agent Identity Tool
 
 A Quick sample Python based script to enumerate Azure AI Foundry Agent Identities (Entra ID Service Principals) and manage their API permissions.
 
