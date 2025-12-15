@@ -1,0 +1,4 @@
+azure-identity
+msgraph-sdk
+httpx
+cffi

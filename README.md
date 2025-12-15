@@ -37,6 +37,11 @@ python entraAgentId.py --grant-permission --identity <object-id> --api microsoft
 
 # Grant multiple permissions
 python entraAgentId.py --grant-permission --identity <object-id> --api microsoft-graph --permission User.Read.All --permission Mail.Read
+
+
+
+python entraAgentId.py --grant-permission --identity 60dad0a7-01c6-4849-bbc7-59197d64ccaf --api microsoft-graph --permission User.Read --delegated
+
 ```
 
 **Revoke Permissions**

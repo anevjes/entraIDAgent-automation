@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """
 Script to list Entra Agent Identities and their app role assignments.
 
@@ -37,7 +37,8 @@ try:
         ApplicationsRequestBuilder,
     )
     import httpx
-except ImportError:
+except ImportError as e:
+    print(f"Error: {e.msg}")
     print("Required packages not installed. Please run:")
     print("  pip install azure-identity msgraph-sdk httpx")
     exit(1)
@@ -557,6 +558,40 @@ class AgentIdentityManager:
 
         return assignments
 
+    async def get_oauth2_permission_grants(self, service_principal_id: str) -> list:
+        """
+        Get delegated permissions (OAuth2PermissionGrants) granted TO this service principal.
+
+        Args:
+            service_principal_id: The ID of the service principal
+
+        Returns:
+            List of OAuth2PermissionGrant objects
+        """
+        grants = []
+
+        try:
+            result = await self.client.service_principals.by_service_principal_id(
+                service_principal_id
+            ).oauth2_permission_grants.get()
+
+            if result and result.value:
+                grants.extend(result.value)
+
+                # Handle pagination
+                while result.odata_next_link:
+                    result = await self.client.service_principals.by_service_principal_id(
+                        service_principal_id
+                    ).oauth2_permission_grants.with_url(result.odata_next_link).get()
+                    if result and result.value:
+                        grants.extend(result.value)
+
+        except Exception as e:
+            # Some SPs might not support this endpoint or return 404 if empty
+            pass
+
+        return grants
+
     async def get_agent_identity_blueprint(self, blueprint_id: str) -> dict:
         """Get agent identity blueprint details."""
         try:
@@ -771,7 +806,7 @@ class AgentIdentityManager:
         try:
             query_params = ServicePrincipalsRequestBuilder.ServicePrincipalsRequestBuilderGetQueryParameters(
                 filter=f"appId eq '{app_id}'",
-                select=["id", "displayName", "appId", "appRoles"],
+                select=["id", "displayName", "appId", "appRoles", "oauth2PermissionScopes"],
                 top=1,
             )
             request_config = ServicePrincipalsRequestBuilder.ServicePrincipalsRequestBuilderGetRequestConfiguration(
@@ -798,6 +833,17 @@ class AgentIdentityManager:
                             "allowedMemberTypes": role.allowed_member_types,
                         }
                         for role in (sp.app_roles or [])
+                    ],
+                    "oauth2PermissionScopes": [
+                        {
+                            "id": str(scope.id),
+                            "value": scope.value,
+                            "adminConsentDisplayName": scope.admin_consent_display_name,
+                            "adminConsentDescription": scope.admin_consent_description,
+                            "isEnabled": scope.is_enabled,
+                            "type": "Delegated"
+                        }
+                        for scope in (sp.oauth2_permission_scopes or [])
                     ],
                 }
         except Exception as e:
@@ -1049,12 +1095,185 @@ class AgentIdentityManager:
         
         return {"error": f"No matching permission assignment found"}
 
+    async def list_delegated_permissions(self, api_name_or_id: str) -> list:
+        """List available delegated permissions (scopes) for a given API."""
+        resource_sp = await self.find_resource_service_principal(api_name_or_id)
+        print(resource_sp)
+
+        if not resource_sp:
+            return []
+        
+        permissions = []
+        for scope in resource_sp.get("oauth2PermissionScopes", []):
+            if scope.get("isEnabled"):
+                permissions.append({
+                    "id": scope["id"],
+                    "name": scope["value"],
+                    "displayName": scope["adminConsentDisplayName"],
+                    "description": scope["adminConsentDescription"],
+                    "type": "Delegated"
+                })
+        
+        return permissions
+
+    async def grant_delegated_permission(
+        self,
+        agent_identity_id: str,
+        api_name_or_id: str,
+        permission_name: str,
+    ) -> dict:
+        """Grant a delegated permission (OAuth2PermissionGrant) to an agent identity."""
+        agent_sp = await self.find_agent_identity_by_id(agent_identity_id)
+        if not agent_sp:
+            return {"error": f"Agent identity not found: {agent_identity_id}"}
+        
+        resource_sp = await self.find_resource_service_principal(api_name_or_id)
+        if not resource_sp:
+            return {"error": f"API service principal not found: {api_name_or_id}"}
+        
+        # Find the scope (delegated permission)
+        scope_name = permission_name
+        
+        # DEBUG: Print resource SP details
+        print(f"DEBUG: Resource SP found: {resource_sp.get('displayName')} ({resource_sp.get('id')})")
+        print(f"DEBUG: Looking for scope: '{scope_name}'")
+        
+        # Check if the scope exists in oauth2PermissionScopes
+        valid_scope = False
+        scopes_list = resource_sp.get("oauth2PermissionScopes", [])
+        print(f"DEBUG: Found {len(scopes_list)} scopes in resource SP")
+
+        for scope in scopes_list:
+            if scope.get("value") == scope_name:
+                valid_scope = True
+                break
+        
+        if not valid_scope:
+             # DEBUG: Print available scopes if not found
+             print(f"DEBUG: Available scopes: {[s.get('value') for s in scopes_list if s.get('value')]}")
+             return {"error": f"Delegated permission (scope) not found: {scope_name}"}
+
+        try:
+            token = self._get_token("https://graph.microsoft.com/.default")
+            
+            # Check if a grant already exists for this resource
+            existing_grants = await self.get_oauth2_permission_grants(agent_sp["id"])
+            existing_grant = None
+            for grant in existing_grants:
+                if grant.resource_id == resource_sp["id"]:
+                    existing_grant = grant
+                    break
+            
+            async with httpx.AsyncClient(http2=False, timeout=30.0) as client:
+                if existing_grant:
+                    # Update existing grant
+                    current_scopes = existing_grant.scope.split(" ")
+                    if scope_name in current_scopes:
+                         return {
+                            "success": True,
+                            "message": f"Permission {scope_name} is already granted",
+                            "already_exists": True,
+                        }
+                    
+                    new_scopes = " ".join(current_scopes + [scope_name])
+                    
+                    response = await client.patch(
+                        f"https://graph.microsoft.com/v1.0/oauth2PermissionGrants/{existing_grant.id}",
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        json={"scope": new_scopes},
+                    )
+                else:
+                    # Create new grant
+                    grant_body = {
+                        "clientId": agent_sp["id"],
+                        "resourceId": resource_sp["id"],
+                        "scope": scope_name,
+                        "consentType": "AllPrincipals", 
+                        "principalId": None
+                    }
+                    
+                    response = await client.post(
+                        f"https://graph.microsoft.com/v1.0/oauth2PermissionGrants",
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        json=grant_body,
+                    )
+
+                if response.status_code in [200, 201, 204]:
+                     return {
+                        "success": True,
+                        "message": f"Successfully granted {scope_name} to {agent_sp['displayName']}",
+                    }
+                else:
+                     return {"error": f"Failed to grant permission: {response.status_code}", "details": response.text}
+
+        except Exception as e:
+            return {"error": f"Exception granting permission: {str(e)}"}
+
+    async def revoke_delegated_permission(
+        self,
+        agent_identity_id: str,
+        api_name_or_id: str,
+        permission_name: str,
+    ) -> dict:
+        """Revoke a delegated permission from an agent identity."""
+        agent_sp = await self.find_agent_identity_by_id(agent_identity_id)
+        if not agent_sp:
+            return {"error": f"Agent identity not found: {agent_identity_id}"}
+        
+        resource_sp = await self.find_resource_service_principal(api_name_or_id)
+        if not resource_sp:
+            return {"error": f"API service principal not found: {api_name_or_id}"}
+            
+        try:
+            token = self._get_token("https://graph.microsoft.com/.default")
+            
+            # Find existing grant
+            existing_grants = await self.get_oauth2_permission_grants(agent_sp["id"])
+            target_grant = None
+            for grant in existing_grants:
+                if grant.resource_id == resource_sp["id"]:
+                    target_grant = grant
+                    break
+            
+            if not target_grant:
+                return {"error": "No delegated permissions found for this API"}
+            
+            current_scopes = target_grant.scope.split(" ")
+            if permission_name not in current_scopes:
+                return {"error": f"Permission {permission_name} not found in current grant"}
+            
+            new_scopes = [s for s in current_scopes if s != permission_name]
+            
+            async with httpx.AsyncClient(http2=False, timeout=30.0) as client:
+                if not new_scopes:
+                    # Delete the grant if no scopes left
+                    response = await client.delete(
+                        f"https://graph.microsoft.com/v1.0/oauth2PermissionGrants/{target_grant.id}",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                else:
+                    # Update the grant with remaining scopes
+                    response = await client.patch(
+                        f"https://graph.microsoft.com/v1.0/oauth2PermissionGrants/{target_grant.id}",
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        json={"scope": " ".join(new_scopes)},
+                    )
+                
+                if response.status_code in [200, 204]:
+                    return {"success": True, "message": f"Revoked {permission_name}"}
+                else:
+                    return {"error": f"Failed to revoke: {response.status_code}"}
+
+        except Exception as e:
+            return {"error": f"Exception revoking permission: {str(e)}"}
+
     async def get_full_agent_identity_details(self) -> list:
         """Get all agent identities with their app role information."""
         results = []
         agent_identities = await self.list_agent_identities()
         
         # Cache for resource service principals to avoid repeated lookups
+        # Structure: resource_id -> { "displayName": str, "appRoles": {id: value} }
         resource_sp_cache = {}
 
         for idx, agent in enumerate(agent_identities):
@@ -1065,13 +1284,62 @@ class AgentIdentityManager:
             extended_info = await self.get_agent_identity_extended_info(agent_id)
             blueprint_id = extended_info.get("agentIdentityBlueprintId")
             app_role_assignments = await self.get_app_role_assignments(agent_id)
+            oauth2_permission_grants = await self.get_oauth2_permission_grants(agent_id)
             
             # Group assignments by resource (API)
             assignments_by_resource = {}
+            
+            # Process App Role Assignments
             for assignment in app_role_assignments:
                 resource_name = assignment.resource_display_name or "Unknown"
                 resource_id = str(assignment.resource_id) if assignment.resource_id else None
                 role_id = str(assignment.app_role_id) if assignment.app_role_id else None
+                
+                # Ensure resource info is cached
+                if resource_id and resource_id not in resource_sp_cache:
+                    try:
+                        sp = await self.client.service_principals.by_service_principal_id(resource_id).get()
+                        resource_sp_cache[resource_id] = {
+                            "displayName": sp.display_name,
+                            "appRoles": {r.id: r.value for r in sp.app_roles if r.value} if sp.app_roles else {}
+                        }
+                    except Exception:
+                        resource_sp_cache[resource_id] = {"displayName": resource_name, "appRoles": {}}
+                
+                # Use cached display name if available and original was Unknown
+                if resource_name == "Unknown" and resource_id in resource_sp_cache:
+                     resource_name = resource_sp_cache[resource_id]["displayName"]
+
+                if resource_name not in assignments_by_resource:
+                    assignments_by_resource[resource_name] = {
+                        "resourceId": resource_id,
+                        "permissions": []
+                    }
+                
+                # Look up permission name
+                permission_name = role_id
+                if resource_id and role_id:
+                    role_map = resource_sp_cache.get(resource_id, {}).get("appRoles", {})
+                    permission_name = role_map.get(role_id, role_id)
+                
+                assignments_by_resource[resource_name]["permissions"].append(permission_name)
+
+            # Process Delegated Permissions
+            for grant in oauth2_permission_grants:
+                resource_id = str(grant.resource_id)
+                
+                # Ensure resource info is cached
+                if resource_id and resource_id not in resource_sp_cache:
+                    try:
+                        sp = await self.client.service_principals.by_service_principal_id(resource_id).get()
+                        resource_sp_cache[resource_id] = {
+                            "displayName": sp.display_name,
+                            "appRoles": {r.id: r.value for r in sp.app_roles if r.value} if sp.app_roles else {}
+                        }
+                    except Exception:
+                        resource_sp_cache[resource_id] = {"displayName": "Unknown", "appRoles": {}}
+                
+                resource_name = resource_sp_cache.get(resource_id, {}).get("displayName", "Unknown")
                 
                 if resource_name not in assignments_by_resource:
                     assignments_by_resource[resource_name] = {
@@ -1079,27 +1347,10 @@ class AgentIdentityManager:
                         "permissions": []
                     }
                 
-                # Look up permission name from resource SP's app roles
-                permission_name = role_id  # Default to role ID
-                if resource_id and role_id:
-                    if resource_id not in resource_sp_cache:
-                        # Fetch the resource SP to get app roles
-                        try:
-                            sp = await self.client.service_principals.by_service_principal_id(resource_id).get()
-                            if sp and sp.app_roles:
-                                resource_sp_cache[resource_id] = {
-                                    r.id: r.value for r in sp.app_roles if r.value
-                                }
-                            else:
-                                resource_sp_cache[resource_id] = {}
-                        except Exception:
-                            resource_sp_cache[resource_id] = {}
-                    
-                    # Look up the role name
-                    role_map = resource_sp_cache.get(resource_id, {})
-                    permission_name = role_map.get(role_id, role_id)
-                
-                assignments_by_resource[resource_name]["permissions"].append(permission_name)
+                if grant.scope:
+                    for scope in grant.scope.split(" "):
+                        if scope:
+                            assignments_by_resource[resource_name]["permissions"].append(f"{scope} (Delegated)")
 
             agent_details = {
                 "displayName": agent.display_name,
@@ -1426,6 +1677,13 @@ Examples:
              "Can be specified multiple times. Pairs with --api in order.",
     )
 
+    parser.add_argument(
+        "--delegated",
+        action="store_true",
+        help="Specify that the permission operation is for delegated permissions (OAuth2PermissionGrant). "
+             "Default is application permissions (AppRoleAssignment).",
+    )
+
     args = parser.parse_args()
 
     print("Entra Agent Identity Scanner")
@@ -1528,14 +1786,18 @@ Examples:
             for api in apis:
                 print(f"\nFetching available permissions for '{api}'...")
                 
-                permissions = await manager.list_api_permissions(api)
+                if args.delegated:
+                    permissions = await manager.list_delegated_permissions(api)
+                else:
+                    permissions = await manager.list_api_permissions(api)
                 
                 if not permissions:
                     print(f"No permissions found or API '{api}' not found.")
                     print("Available API names: microsoft-graph, graph, sharepoint, exchange, azure-management, key-vault, storage")
                     continue
                 
-                print(f"\nAvailable application permissions for {api} ({len(permissions)} found):")
+                perm_type = "delegated" if args.delegated else "application"
+                print(f"\nAvailable {perm_type} permissions for {api} ({len(permissions)} found):")
                 print("-" * 60)
                 for perm in sorted(permissions, key=lambda x: x.get('name', '')):
                     print(f"  {perm.get('name', 'N/A')}")
@@ -1637,11 +1899,18 @@ Examples:
                 print(f"  SP Type: {identity['spType']}")
                 
                 for api, perm in permission_pairs:
-                    result = await manager.grant_api_permission(
-                        agent_identity_id=identity['objectId'],
-                        api_name_or_id=api,
-                        permission_name_or_id=perm
-                    )
+                    if args.delegated:
+                        result = await manager.grant_delegated_permission(
+                            agent_identity_id=identity['objectId'],
+                            api_name_or_id=api,
+                            permission_name=perm
+                        )
+                    else:
+                        result = await manager.grant_api_permission(
+                            agent_identity_id=identity['objectId'],
+                            api_name_or_id=api,
+                            permission_name_or_id=perm
+                        )
                     
                     if result.get("success"):
                         print(f"  [OK] {api}: {perm}")
@@ -1679,11 +1948,18 @@ Examples:
             
             success_count = 0
             for api, perm in permission_pairs:
-                result = await manager.grant_api_permission(
-                    agent_identity_id=args.identity,
-                    api_name_or_id=api,
-                    permission_name_or_id=perm
-                )
+                if args.delegated:
+                    result = await manager.grant_delegated_permission(
+                        agent_identity_id=args.identity,
+                        api_name_or_id=api,
+                        permission_name=perm
+                    )
+                else:
+                    result = await manager.grant_api_permission(
+                        agent_identity_id=args.identity,
+                        api_name_or_id=api,
+                        permission_name_or_id=perm
+                    )
                 
                 if result.get("success"):
                     print(f"  [OK] {api}: {perm}")
@@ -1719,11 +1995,18 @@ Examples:
             print(f"\nRevoking {len(permission_pairs)} permission(s) from identity '{args.identity}'...")
             
             for api, perm in permission_pairs:
-                result = await manager.revoke_api_permission(
-                    agent_identity_id=args.identity,
-                    api_name_or_id=api,
-                    permission_name_or_id=perm
-                )
+                if args.delegated:
+                    result = await manager.revoke_delegated_permission(
+                        agent_identity_id=args.identity,
+                        api_name_or_id=api,
+                        permission_name=perm
+                    )
+                else:
+                    result = await manager.revoke_api_permission(
+                        agent_identity_id=args.identity,
+                        api_name_or_id=api,
+                        permission_name_or_id=perm
+                    )
                 
                 if result.get("success"):
                     print(f"  [OK] Revoked {api}: {perm}")
